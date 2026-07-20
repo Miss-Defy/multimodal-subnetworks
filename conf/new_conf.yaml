@@ -30,7 +30,7 @@ model:
   #   batchnorm      — standard nn.BatchNorm3d (original behaviour)
   #   groupnorm      — nn.GroupNorm, one group per channel, no affine params
   #   modalbatchnorm — separate BatchNorm3d per modality (fALFF / sMRI / DWI)
-  norm_type: "groupnorm"                                            ### 20260630
+  norm_type: "batchnorm"                                            ### 20260630
   use_me: True  
   loss_weight: [0.5, 0.5]  
 
@@ -59,7 +59,7 @@ experiment:
   dbfields: ["falff"]
   metafields: ["gender_encoded"]
   epochs: 100
-  max_subjects: 100   # Set to null or an integer (e.g. 100) to cap the subject pool for quick tests
+  max_subjects: null   # Set to null or an integer (e.g. 100) to cap the subject pool for quick tests
   prefetches: 16
   num_workers: 12
   prefetch_factor: 4
@@ -73,7 +73,7 @@ experiment:
   eval_persistent_workers: True
   profile_timings: False
   timing_sync_cuda: True
-  cudnn_benchmark: False
+  cudnn_benchmark: True
   attenuates: 0.8
 
 resnet_specific:
@@ -83,4 +83,4 @@ resnet_specific:
   initial_kernel: 7
   initial_pool: True
   dropout: 0.2
-  use_checkpointing: True
+  use_checkpointing: False

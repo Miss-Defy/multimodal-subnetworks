@@ -8,6 +8,87 @@ import json
 from pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
 
 
+# ── Normalisation utilities ─────────────────────────────────────────────────  ### 20260630
+
+class MultimodalBatchNorm3d(nn.Module):
+    """Per-modality BatchNorm3d.
+
+    Maintains a separate nn.BatchNorm3d for each modality (e.g. fALFF=0,
+    sMRI=1, DWI=2).  Before each forward pass, call set_modalities() with
+    the integer modality tensor for the current batch so the layer knows
+    which samples belong to which modality.  Each sample is then normalised
+    using only the statistics of its own modality group.
+
+    Falls back to the first BN at eval time or when modality IDs have not
+    been set, which keeps inference simple and stateless.
+
+    Args:
+        num_features   : number of channels (same meaning as BatchNorm3d).
+        num_modalities : how many distinct modalities to support (default 3).
+        **kwargs       : forwarded verbatim to every underlying BatchNorm3d.
+    """
+
+    def __init__(self, num_features: int, num_modalities: int = 3, **kwargs):
+        super().__init__()
+        self.num_modalities = num_modalities
+        # One independent BN per modality
+        self.bns = nn.ModuleList(
+            [nn.BatchNorm3d(num_features, **kwargs) for _ in range(num_modalities)]
+        )
+        self._modalities = None  # populated via set_modalities() before forward
+
+    def set_modalities(self, modalities) -> None:
+        """Store the modality-ID tensor for the current batch.
+
+        Args:
+            modalities: 1-D integer tensor of length batch_size where each
+                        element is the modality index (0, 1, 2, …) for that
+                        sample.  Pass None to reset.
+        """
+        self._modalities = modalities
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # At eval time or when modalities are unknown, use modality-0 BN for all
+        if self._modalities is None or not self.training:
+            return self.bns[0](x)
+
+        out = torch.zeros_like(x)
+        for m_id, bn in enumerate(self.bns):
+            mask = (self._modalities == m_id)
+            if mask.any():
+#                out[mask] = bn(x[mask])
+                if mask.all():                            #### 20260715 Claude and Lisa
+                    out = bn(x)                           #### 20260715 Claude and Lisa
+                else:                                    #### 20260715 Claude and Lisa
+                    out[mask] = bn(x[mask])       #### 20260715 Claude and Lisa
+        return out
+
+
+def _make_norm(num_channels: int, norm_type: str, num_modalities: int = 3) -> nn.Module:
+    """Return the requested normalisation layer for num_channels channels.
+
+    Args:
+        num_channels  : number of feature-map channels to normalise.
+        norm_type     : one of "batchnorm", "groupnorm", "modalbatchnorm".
+        num_modalities: only used when norm_type == "modalbatchnorm".
+
+    Returns:
+        An nn.Module that can be used in place of nn.BatchNorm3d.
+    """
+    if norm_type == "groupnorm":
+        # One group per channel (instance-norm style), no learned affine params.
+        # Follows the approach in the reference resnet.py provided by the team.
+        return nn.GroupNorm(
+            num_groups=num_channels, num_channels=num_channels, affine=False
+        )
+    elif norm_type == "modalbatchnorm":
+        return MultimodalBatchNorm3d(
+            num_channels, num_modalities=num_modalities, track_running_stats=True
+        )
+    else:  # "batchnorm" — standard default, preserves original behaviour
+        return nn.BatchNorm3d(num_channels, track_running_stats=True)  ### 20260630
+
+
 def set_channel_num(config, in_channels, n_classes, channels):
     """
     Takes a configuration json for a convolutional neural network of MeshNet architecture and changes it to have the specified number of input channels, output classes, and number of channels that each layer except the input and output layers have.
@@ -77,22 +158,23 @@ def init_weights(model):
 
 class BasicBlock3D(nn.Module):
     """3D ResNet basic block with memory optimizations"""
-    def __init__(self, in_channels, out_channels, stride=1, dropout_p=0.0):
+    def __init__(self, in_channels, out_channels, stride=1, dropout_p=0.0,  ### 20260630
+                 norm_type="batchnorm"):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, 
-                              stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_channels, track_running_stats=True)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = _make_norm(out_channels, norm_type)   # ← was nn.BatchNorm3d
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3,
-                              stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels, track_running_stats=True)
+                               stride=1, padding=1, bias=False)
+        self.bn2 = _make_norm(out_channels, norm_type)   # ← was nn.BatchNorm3d
         self.dropout = nn.Dropout3d(dropout_p)
-        
+
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, 
-                         kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm3d(out_channels)
+                nn.Conv3d(in_channels, out_channels,
+                          kernel_size=1, stride=stride, bias=False),
+                _make_norm(out_channels, norm_type),     # ← was nn.BatchNorm3d  ### 20260630
             )
 
     def forward(self, x):
@@ -104,38 +186,42 @@ class BasicBlock3D(nn.Module):
 
 class ResNet3D(nn.Module):
     """3D ResNet with same interface as original MeshNet"""
-    def __init__(self, in_channels, n_classes, channels, config_file=None):
+    def __init__(self, in_channels, n_classes, channels, config_file=None,  ### 20260630
+                 norm_type="batchnorm"):
         super().__init__()
         # Configurable parameters (maintaining compatibility)
         self.in_channels = in_channels
         self.n_classes = 1  # Binary classification
         self.channels = channels
-        
+        self.norm_type = norm_type
+
         # Initial layers
-        self.conv1 = nn.Conv3d(in_channels, channels, kernel_size=7, 
-                              stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm3d(channels)
+        self.conv1 = nn.Conv3d(in_channels, channels, kernel_size=7,
+                               stride=2, padding=3, bias=False)
+        self.bn1 = _make_norm(channels, norm_type)       # ← was nn.BatchNorm3d
         self.maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
-        
-        # Residual blocks
-        self.layer1 = self._make_layer(channels, channels, blocks=2, stride=1)
-        self.layer2 = self._make_layer(channels, channels*2, blocks=2, stride=2)
-        self.layer3 = self._make_layer(channels*2, channels*4, blocks=2, stride=2)
-        self.layer4 = self._make_layer(channels*4, channels*8, blocks=2, stride=2)
-        
+
+        # Residual blocks — norm_type threaded into every block
+        self.layer1 = self._make_layer(channels,    channels,    blocks=2, stride=1)
+        self.layer2 = self._make_layer(channels,    channels*2,  blocks=2, stride=2)
+        self.layer3 = self._make_layer(channels*2,  channels*4,  blocks=2, stride=2)
+        self.layer4 = self._make_layer(channels*4,  channels*8,  blocks=2, stride=2)
+
         # Classification head
         self.avgpool = nn.AdaptiveAvgPool3d(1)
         self.fc = nn.Linear(channels*8, 1)
-        
+
         # Initialize weights
         self.apply(self._init_weights)
-    
+
     def _make_layer(self, in_channels, out_channels, blocks, stride):
         layers = []
-        layers.append(BasicBlock3D(in_channels, out_channels, stride))
+        layers.append(BasicBlock3D(in_channels, out_channels, stride,
+                                   norm_type=self.norm_type))
         for _ in range(1, blocks):
-            layers.append(BasicBlock3D(out_channels, out_channels))
-        return nn.Sequential(*layers)
+            layers.append(BasicBlock3D(out_channels, out_channels,
+                                       norm_type=self.norm_type))
+        return nn.Sequential(*layers)  ### 20260630
     
     def _init_weights(self, m):
         if isinstance(m, nn.Conv3d):
@@ -157,6 +243,19 @@ class ResNet3D(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
+
+    def set_modalities(self, modalities) -> None:  ### 20260630
+        """Propagate modality IDs to every MultimodalBatchNorm3d in the model.
+
+        Call this before each forward pass when norm_type == "modalbatchnorm".
+
+        Args:
+            modalities: 1-D integer tensor (batch_size,) with modality index
+                        per sample, or None to reset.
+        """
+        for module in self.modules():
+            if isinstance(module, MultimodalBatchNorm3d):
+                module.set_modalities(modalities)  ### 20260630
 
 class enMesh_checkpoint(ResNet3D):
     """Memory-efficient version with gradient checkpointing"""

@@ -43,29 +43,28 @@ class MultiMaskSNIPWrapper(nn.Module):
     def register_multimodal_masks(self, modalities, input_data, labels):
         """
         Initialization step (Run ONCE before training):
-        1. Creates a temporary CPU copy of the model for SNIP calculation.
+        1. Creates a temporary GPU copy of the model for SNIP calculation.
         2. Generates masks for each modality found in the input.
         3. Registers the masks as parametrizations on the main model.
         """
-        # Create temp model for calculations (prevents messing with main model gradients)
-        cpu_model = deepcopy(self.model).to('cpu')
-        cpu_optimizer = torch.optim.SGD(cpu_model.parameters(), 0.1)
-        
-        # Determine target device for final masks (usually the GPU the main model is on)
+        # Determine target device (GPU the main model is on)
         target_device = next(iter(self.model.parameters())).device
+
+        # Create temp model on same device (prevents messing with main model gradients)
+        temp_model = deepcopy(self.model).to(target_device)
+        temp_optimizer = torch.optim.SGD(temp_model.parameters(), 0.1)
 
         # 1. Generate Masks Dictionary: {mod_id: {layer_name: mask}}
         temp_mask_storage = {}
         unique_modalities = torch.unique(modalities).cpu().detach().tolist()
-        
+
         for mod in unique_modalities:
             print(f"Generating SNIP masks for modality: {mod}")
             mask_idx = (modalities == mod)
-            batch = (input_data[mask_idx], labels[mask_idx])
-            
-            # Calculate scores using local CPU model
+            batch = (input_data[mask_idx].to(target_device), labels[mask_idx].to(target_device))
+
             masks_by_name = self._generate_mask_from_grad_scores(
-                cpu_model, cpu_optimizer, batch, target_device
+                temp_model, temp_optimizer, batch, target_device
             )
             temp_mask_storage[mod] = masks_by_name
 
@@ -79,17 +78,19 @@ class MultiMaskSNIPWrapper(nn.Module):
                     if name in mask_dict:
                         layer_masks[mod] = mask_dict[name]
                         has_masks = True
-                
+
                 if has_masks:
                     snip_mask_module = MultimodalSNIPMask(layer_masks)
                     parametrize.register_parametrization(module, "weight", snip_mask_module)
-        
+
         self.masks_registered = True
-        
-        # Cleanup to free memory
-        del cpu_model
-        del cpu_optimizer
-        print("Mask initialization complete. Temporary CPU model cleared.")
+
+        # Cleanup to free GPU memory
+        del temp_model
+        del temp_optimizer
+        if target_device.type == 'cuda':
+            torch.cuda.empty_cache()
+        print("Mask initialization complete. Temporary GPU model cleared.")
 
     def forward(self, input_data, modalities):
         if not self.masks_registered:
@@ -109,14 +110,18 @@ class MultiMaskSNIPWrapper(nn.Module):
         for mod in unique_mods:
             mod_idx = (modalities == mod)
             sub_data = input_data[mod_idx]
-            
+
             # A. Set the Active Modality
             self._set_active_modality(mod)
-            
+            sub_mods = torch.full((sub_data.shape[0],), int(mod), dtype=torch.long, device=sub_data.device)   ### 20260715 Claude and Lisa
+            for m in self.model.modules():                                         ### 20260715 Claude and Lisa
+                if hasattr(m, '_modalities') and hasattr(m, 'set_modalities'):       ### 20260715 Claude and Lisa
+                    m.set_modalities(sub_mods)                                      ### 20260715 Claude and Lisa
+
             # B. Forward Pass (Autograd tracks: output = weight * mask_mod)
             sub_output = self.model(sub_data)
             final_outputs[mod_idx] = sub_output
-            
+
         # C. Reset to Identity (No mask)
         self._set_active_modality(None)
         
@@ -129,38 +134,6 @@ class MultiMaskSNIPWrapper(nn.Module):
                 for param_module in module.parametrizations.weight:
                     if isinstance(param_module, MultimodalSNIPMask):
                         param_module.active_mod_id = mod_id
-
-    def mask_gradients(self, active_modalities):
-        """
-        Call after loss.backward() and before optimizer.step().
-
-        Zeros out gradients for any weight that was masked to 0 for ALL
-        modalities in the current batch. This prevents a modality from
-        nudging weights it never actually used during the forward pass.
-
-        Args:
-            active_modalities: tensor of modality integer codes present in
-                               the current batch (e.g. from torch.unique(modality))
-        """
-        for module in self.model.modules():
-            if parametrize.is_parametrized(module, "weight"):
-                if module.parametrizations.weight.original.grad is None:
-                    continue
-                # Build the union of masks for every modality in this batch.
-                # A weight is in the union if ANY modality's mask is 1 for it.
-                union_mask = torch.zeros_like(module.parametrizations.weight.original.data)
-                for param_module in module.parametrizations.weight:
-                    if isinstance(param_module, MultimodalSNIPMask):
-                        for mod in active_modalities:
-                            mod_key = int(mod)
-                            if hasattr(param_module, f'mask_{mod_key}'):
-                                union_mask = torch.logical_or(
-                                    union_mask.bool(),
-                                    getattr(param_module, f'mask_{mod_key}').bool()
-                                ).float()
-                # Zero out gradients for weights outside the union mask.
-                # These weights contributed nothing to any forward pass this step.
-                module.parametrizations.weight.original.grad *= union_mask
 
     def prepare_for_loading(self, modalities_list):
         """
@@ -188,7 +161,7 @@ class MultiMaskSNIPWrapper(nn.Module):
     def _generate_mask_from_grad_scores(self, model, optimizer, batch, target_device):
         scores_dict = self._calculate_scores(model, optimizer, batch)
         threshold = self._get_threshold_from_scores(scores_dict)
-        
+
         masks = {}
         for name, values in scores_dict.items():
             masks[name] = (values > threshold).float().to(target_device)
@@ -196,16 +169,14 @@ class MultiMaskSNIPWrapper(nn.Module):
 
     def _calculate_scores(self, model, optimizer, batch):
         data, labels = batch
-        # Force data to CPU to match the CPU copy of the model
-        data, labels = data.to('cpu'), labels.to('cpu')
-        
+
         model.train()
         optimizer.zero_grad()
-        
+
         preds = model(data)
         loss = F.binary_cross_entropy_with_logits(preds, labels.float())
         loss.backward()
-        
+
         scores_d = {}
         for name, module in model.named_modules():
             if isinstance(module, PRUNE_LAYERS) and module.weight.grad is not None:
@@ -237,18 +208,16 @@ class MultiMaskSNIPWrapper(nn.Module):
         """
         print("Initializing multimodal model from unimodal models...")
 
-        mod_id_list = list(unimodal_models_dict.keys())  # e.g. ['falff', 'smri', 'dwi']
+        mod_id_list = list(unimodal_models_dict.keys())
 
         # Step 1: Extract pretrained masks AND weights from each unimodal model.
-        # ppopov1 checkpoints use 'model.' prefix; strip it to match
-        # self.model.named_modules() which returns names without that prefix.
-        modality_masks = {}   # {mod_id: {layer_name: mask_tensor}}
-        modality_weights = {} # {mod_id: {layer_name: weight_tensor}}
+        # Checkpoints use 'model.' prefix; strip it to match self.model.named_modules().
+        modality_masks = {}
+        modality_weights = {}
         for mod_id, state_dict in unimodal_models_dict.items():
             modality_masks[mod_id] = {}
             modality_weights[mod_id] = {}
             for key, value in state_dict.items():
-                # Strip leading 'model.' so names match self.model.named_modules()
                 stripped = key[len('model.'):] if key.startswith('model.') else key
                 if 'parametrizations.weight' in stripped and 'mask_' in stripped:
                     layer_name = stripped.split('.parametrizations.weight')[0]
@@ -267,25 +236,23 @@ class MultiMaskSNIPWrapper(nn.Module):
             for mod_idx, mod_id in enumerate(mod_id_list):
                 print(f"  SNIP for modality: {mod_id}")
 
-                # Load this modality's pretrained weights into a temporary CPU model
-                cpu_model = deepcopy(self.model).to('cpu')
-                cpu_optimizer = torch.optim.SGD(cpu_model.parameters(), 0.1)
+                temp_model = deepcopy(self.model).to(target_device)
+                temp_optimizer = torch.optim.SGD(temp_model.parameters(), 0.1)
                 pretrained_state = {
                     layer_name + '.weight': w
                     for layer_name, w in modality_weights.get(mod_id, {}).items()
                 }
                 if pretrained_state:
-                    cpu_model.load_state_dict(pretrained_state, strict=False)
+                    temp_model.load_state_dict(pretrained_state, strict=False)
 
-                # Select snip batch for this modality (integer index matches mod_idx)
                 if mod_idx in unique_mod_ints:
                     mask_idx = (modalities_tensor == mod_idx)
                 else:
                     mask_idx = torch.ones(len(modalities_tensor), dtype=torch.bool)
 
-                batch = (input_data[mask_idx], labels[mask_idx])
+                batch = (input_data[mask_idx].to(target_device), labels[mask_idx].to(target_device))
                 snip_masks_for_mod = self._generate_mask_from_grad_scores(
-                    cpu_model, cpu_optimizer, batch, target_device
+                    temp_model, temp_optimizer, batch, target_device
                 )
 
                 for layer_name, pretrained_mask in modality_masks.get(mod_id, {}).items():
@@ -295,12 +262,12 @@ class MultiMaskSNIPWrapper(nn.Module):
                             snip_masks_for_mod[layer_name].bool()
                         ).float()
 
-                del cpu_model, cpu_optimizer
+                del temp_model, temp_optimizer
+                if target_device.type == 'cuda':
+                    torch.cuda.empty_cache()
             print("SNIP intersection complete.")
 
         # Step 3: Register the refined masks on the multimodal model.
-        # Use integer indices as keys so they match the integer modality IDs
-        # produced by torch.unique(modalities) in the forward pass.
         print("Registering modality-specific masks...")
         for name, module in self.model.named_modules():
             if isinstance(module, PRUNE_LAYERS):
@@ -324,16 +291,15 @@ class MultiMaskSNIPWrapper(nn.Module):
 
                 combined_mask = torch.zeros_like(module.parametrizations.weight.original.data)
                 merged_weights = torch.zeros_like(module.parametrizations.weight.original.data)
-                count_matrix  = torch.zeros_like(module.parametrizations.weight.original.data)
+                count_matrix = torch.zeros_like(module.parametrizations.weight.original.data)
 
                 for mod_id in mod_id_list:
                     if name in modality_masks[mod_id]:
                         mod_mask = modality_masks[mod_id][name].to(device)
                         combined_mask = torch.logical_or(combined_mask.bool(), mod_mask.bool()).float()
-                        # Use pretrained weights for this modality; fall back to current weights
                         w = modality_weights[mod_id].get(name, module.parametrizations.weight.original.data)
                         merged_weights += w.to(device) * mod_mask
-                        count_matrix   += mod_mask
+                        count_matrix += mod_mask
 
                 averaged_weights = torch.where(
                     count_matrix > 0,
