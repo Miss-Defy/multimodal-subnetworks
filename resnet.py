@@ -60,7 +60,15 @@ class MultimodalBatchNorm3d(nn.Module):
                 if mask.all():                            #### 20260715 Claude and Lisa
                     out = bn(x)                           #### 20260715 Claude and Lisa
                 else:                                    #### 20260715 Claude and Lisa
-                    out[mask] = bn(x[mask])       #### 20260715 Claude and Lisa
+                    # out[mask] = bn(x[mask])       #### 20260715 Claude and Lisa
+                    x_sub = x[mask].contiguous()         #### 20260804 Claude and Lisa
+                    if x_sub.shape[0] < 2:
+                        bn.eval()
+                        with torch.no_grad():
+                            out[mask] = bn(x_sub)
+                        bn.train()
+                    else:
+                        out[mask] = bn(x_sub)            #### 20260804 Claude and Lisa
         return out
 
 
@@ -79,7 +87,7 @@ def _make_norm(num_channels: int, norm_type: str, num_modalities: int = 3) -> nn
         # One group per channel (instance-norm style), no learned affine params.
         # Follows the approach in the reference resnet.py provided by the team.
         return nn.GroupNorm(
-            num_groups=num_channels, num_channels=num_channels, affine=False
+            num_groups=8, num_channels=num_channels, affine=False
         )
     elif norm_type == "modalbatchnorm":
         return MultimodalBatchNorm3d(
