@@ -220,7 +220,7 @@ class CustomRunner(dl.Runner):
             "mycollate_full": self.client_creator.mycollate_full,
             "mytransform": self.client_creator.mytransform,
         }
-        
+
         self.collate = (
             multimodal_collate if self.multimodal else #MM
             self.funcs["mycollate_full"]
@@ -273,7 +273,7 @@ class CustomRunner(dl.Runner):
         if missing_label_ids:
             raise ValueError(f"Missing labels for ids: {missing_label_ids[:10]}")
         labels = np.array([meta_docs[id][label_field] for id in all_ids])
-    
+
         # Create CV split
         cv_folds = StratifiedKFold(n_splits=self._hparams["experiment"]["cv_folds"], shuffle=True, random_state=self._hparams["experiment"].get("cv_seed", 42))
         train_idx, test_idx = list(cv_folds.split(all_ids, labels))[self._hparams["fold_idx"]]
@@ -314,7 +314,7 @@ class CustomRunner(dl.Runner):
         usedDataset = MultimodalMongoDataset if self.multimodal else CustomMongoDataset #MM
         # Create dataloaders
         train_dataset = usedDataset(
-            train_ids, 
+            train_ids,
             self.funcs["mytransform"],
             None,
             self.db_fields,
@@ -322,7 +322,7 @@ class CustomRunner(dl.Runner):
             normalize=safe_normalize,
             id=self.index_id,
         )
-        
+
         # Train uses a plain DBBatchSampler with a cross-rank-consistent seed
         # (self.sampler_seed, identical on every rank). Catalyst/accelerate's
         # engine.prepare() ALREADY shards the DataLoader across ranks, so a plain
@@ -410,7 +410,7 @@ class CustomRunner(dl.Runner):
             posts_bin.find(
                 {
                     "id": {"$in": snip_ids},
-                    "kind": {"$in": self.db_fields}, 
+                    "kind": {"$in": self.db_fields},
                 },
                 {"id": 1, "chunk": 1, "kind": 1, "chunk_id": 1},
             )
@@ -449,7 +449,7 @@ class CustomRunner(dl.Runner):
                 samples_for_id_kind = chunks_by_id_kind.get((id, mod), [])
                 if not samples_for_id_kind:
                     continue
-                
+
                 samples_for_id_kind.sort(key=lambda x: x["chunk_id"])
                 data = b"".join([s["chunk"] for s in samples_for_id_kind])
 
@@ -531,7 +531,7 @@ class CustomRunner(dl.Runner):
     def get_optimizer(self, model):
         # optimizer = torch.optim.RMSprop(model.parameters(), lr=self.rmsprop_lr)
         # optimizer = torch.optim.Adam(model.parameters(), lr=self.onecycle_lr)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=self.onecycle_lr, weight_decay=0.01)
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.onecycle_lr, weight_decay=0.01)
         return optimizer
 
     def get_scheduler(self, optimizer):

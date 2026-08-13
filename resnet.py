@@ -87,7 +87,7 @@ def _make_norm(num_channels: int, norm_type: str, num_modalities: int = 3) -> nn
         # One group per channel (instance-norm style), no learned affine params.
         # Follows the approach in the reference resnet.py provided by the team.
         return nn.GroupNorm(
-            num_groups=8, num_channels=num_channels, affine=False
+            num_groups=num_channels, num_channels=num_channels, affine=False
         )
     elif norm_type == "modalbatchnorm":
         return MultimodalBatchNorm3d(
@@ -230,23 +230,23 @@ class ResNet3D(nn.Module):
             layers.append(BasicBlock3D(out_channels, out_channels,
                                        norm_type=self.norm_type))
         return nn.Sequential(*layers)  ### 20260630
-    
+
     def _init_weights(self, m):
         if isinstance(m, nn.Conv3d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
         elif isinstance(m, nn.BatchNorm3d):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
-    
+
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
-        
+
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        
+
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
@@ -271,21 +271,21 @@ class enMesh_checkpoint(ResNet3D):
         # Forward pass with checkpointing
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
-        
+
         x = checkpoint_sequential(self.layer1, len(self.layer1), x)
         x = checkpoint_sequential(self.layer2, len(self.layer2), x)
         x = checkpoint_sequential(self.layer3, len(self.layer3), x)
         x = checkpoint_sequential(self.layer4, len(self.layer4), x)
-        
+
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = torch.sigmoid(self.fc(x))
         return x
-    
+
     def eval_forward(self, x):
         with torch.inference_mode():
             return super().forward(x)
-    
+
     def forward(self, x):
         if self.training:
             return self.train_forward(x)
@@ -382,10 +382,10 @@ class enMesh(enMesh_checkpoint):
 
         gradients = {}
         layers = [self.conv1, self.bn1, self.maxpool,
-                 *self.layer1, *self.layer2, 
+                 *self.layer1, *self.layer2,
                  *self.layer3, *self.layer4,
                  self.avgpool, self.fc]
-        
+
         for p in layers:
             self.unset_grad(p)
 
@@ -395,7 +395,7 @@ class enMesh(enMesh_checkpoint):
         self.set_grad(layers[-1])
         input = x
         input.requires_grad = False
-        
+
         # Forward pass
         input = self.train_forward(input)
         y_hat = input
@@ -459,15 +459,15 @@ class enMesh(enMesh_checkpoint):
             del x.grad
             del input
             x.requires_grad = False
-            
+
         del dloss_dx2
         self.eval()
-        
+
         if not self.optimize_inline:
             for i in range(len(layers)):
                 for p, g in zip(layers[i].parameters(), gradients[i]):
                     p.grad = g
-        
+
         del layers
         if verbose:
             info = nvmlDeviceGetMemoryInfo(h)
